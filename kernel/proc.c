@@ -15,6 +15,9 @@ struct proc *initproc;
 int nextpid = 1;
 struct spinlock pid_lock;
 
+int next_thread_id = 1;
+struct spinlock thread_id_lock;
+
 extern void forkret(void);
 static void freeproc(struct proc *p);
 
@@ -51,11 +54,24 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  initlock(&thread_id_lock, "next_thread_id");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
       p->kstack = KSTACK((int) (p - proc));
+      p->thread_id = 0;
   }
+}
+
+int alloc_thread_id() {
+  int thread_id;
+
+  acquire(&thread_id_lock);
+  thread_id = next_thread_id;
+  next_thread_id = next_thread_id + 1;
+  release(&thread_id_lock);
+
+  return thread_id;
 }
 
 // Must be called with interrupts disabled,
@@ -107,7 +123,7 @@ allocpid()
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
 static struct proc*
-allocproc(void)
+allocproc(void) 
 {
   struct proc *p;
 
@@ -153,12 +169,14 @@ found:
 // including user pages.
 // p->lock must be held.
 static void
-freeproc(struct proc *p)
-{
+freeproc(struct proc *p) 
+{  
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pagetable)
+  if(p->pagetable != 0 && p->thread_id != 0){
+    uvmunmap(p->pagetable, TRAPFRAME - PGSIZE * (p->thread_id), 1, 0);
+  }else if(p->thread_id == 0)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
   p->sz = 0;
@@ -311,6 +329,7 @@ fork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
+  np->thread_id = 0;
 
   release(&np->lock);
 
@@ -387,9 +406,7 @@ exit(int status)
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int
-wait(uint64 addr)
-{
+int wait(uint64 addr) {
   struct proc *pp;
   int havekids, pid;
   struct proc *p = myproc();
@@ -409,7 +426,7 @@ wait(uint64 addr)
           // Found one.
           pid = pp->pid;
           if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
-                                  sizeof(pp->xstate)) < 0) {
+                                   sizeof(pp->xstate)) < 0) {
             release(&pp->lock);
             release(&wait_lock);
             return -1;
@@ -418,6 +435,22 @@ wait(uint64 addr)
           release(&pp->lock);
           release(&wait_lock);
           return pid;
+        } else {
+          havekids = 1;
+          if (pp->state == ZOMBIE) {
+            // Found one.
+            pid = pp->pid;
+            if (addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
+                                     sizeof(pp->xstate)) < 0) {
+              release(&pp->lock);
+              release(&wait_lock);
+              return -1;
+            }
+            freeproc(pp);
+            release(&pp->lock);
+            release(&wait_lock);
+            return pid;
+          }
         }
         release(&pp->lock);
       }
@@ -428,7 +461,7 @@ wait(uint64 addr)
       release(&wait_lock);
       return -1;
     }
-    
+
     // Wait for a child to exit.
     sleep(p, &wait_lock);  //DOC: wait-sleep
   }
@@ -680,4 +713,100 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+static struct proc*
+allocproc_thread(struct proc *parent)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == UNUSED) {
+      goto found;
+    } else {
+      release(&p->lock);
+    }
+  }
+  return 0;
+
+found:
+  p->pid = allocpid();
+  p->state = USED;
+  p->thread_id = alloc_thread_id();
+
+  // Allocate a trapframe page.
+  if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // Use the parent's page table.
+  p->pagetable = parent->pagetable;
+
+  if (mappages(p->pagetable, TRAPFRAME - PGSIZE * p->thread_id, PGSIZE,
+               (uint64)(p->trapframe), PTE_R | PTE_W) < 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // Set up new context to start executing at forkret,
+  // which returns to user space.
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = (uint64)forkret;
+  p->context.sp = p->kstack + PGSIZE;
+
+  return p;
+}
+
+int 
+clone(void *stack)
+{
+  int i, thread_id;
+  struct proc *np;
+  struct proc *p = myproc();
+
+  // Allocate process.
+  if ((np = allocproc_thread(p)) == 0) {
+    return -1;
+  }
+
+  // copy saved user registers.
+  *(np->trapframe) = *(p->trapframe);
+
+  np->sz = p->sz;
+
+  // Cause fork to return 0 in the child.
+  np->trapframe->a0 = 0;
+
+  if (stack) {
+    np->trapframe->sp = (uint64)stack;
+  } else {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+
+  // increment reference counts on open file descriptors.
+  for (i = 0; i < NOFILE; i++)
+    if (p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+
+  thread_id = np->thread_id;
+
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return thread_id;
 }
