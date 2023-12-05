@@ -406,7 +406,8 @@ exit(int status)
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int wait(uint64 addr) {
+int
+wait(uint64 addr) {
   struct proc *pp;
   int havekids, pid;
   struct proc *p = myproc();
@@ -435,22 +436,6 @@ int wait(uint64 addr) {
           release(&pp->lock);
           release(&wait_lock);
           return pid;
-        } else {
-          havekids = 1;
-          if (pp->state == ZOMBIE) {
-            // Found one.
-            pid = pp->pid;
-            if (addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
-                                     sizeof(pp->xstate)) < 0) {
-              release(&pp->lock);
-              release(&wait_lock);
-              return -1;
-            }
-            freeproc(pp);
-            release(&pp->lock);
-            release(&wait_lock);
-            return pid;
-          }
         }
         release(&pp->lock);
       }
